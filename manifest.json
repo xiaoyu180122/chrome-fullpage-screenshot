@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "一键长截屏 - DevTools原生全尺寸截图",
+  "short_name": "一键长截屏",
+  "version": "1.0.0",
+  "description": "基于 Chrome DevTools 原生底层引擎，点击一下直接保存全网页超高清长图，彻底告别吸顶栏重复与断层，免开 F12 控制台。",
+  "author": "Antigravity Engineering",
+  "permissions": [
+    "debugger",
+    "activeTab",
+    "downloads",
+    "storage",
+    "contextMenus",
+    "scripting"
+  ],
+  "action": {
+    "default_title": "点击一键长截屏 (Alt+Shift+S)",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "一键触发全网页长截屏"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

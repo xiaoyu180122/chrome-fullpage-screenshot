@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>长截屏插件设置 - DevTools 原生全景快照</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <div class="logo-box">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/>
+            <circle cx="12" cy="13" r="3"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="title">一键长截屏 设置</h1>
+          <p class="subtitle">Chrome DevTools 原生底层驱动 · 像素级完整网页快照</p>
+        </div>
+      </div>
+      <div class="save-badge" id="saveStatus">
+        <span class="pulse-dot"></span>
+        <span id="saveStatusText">配置已即时同步</span>
+      </div>
+    </header>
+
+    <main class="content-grid">
+      <!-- Left Column: Settings -->
+      <section class="settings-col">
+        <!-- Card 1: 格式与渲染 -->
+        <div class="card">
+          <h2 class="card-title">
+            <span class="card-icon">🎨</span>
+            图像与渲染设置
+          </h2>
+
+          <div class="form-group">
+            <label class="form-label" for="formatSelect">图片导出格式</label>
+            <div class="radio-group" id="formatGroup">
+              <label class="radio-item active" data-value="png">
+                <input type="radio" name="format" value="png" checked>
+                <div class="radio-content">
+                  <span class="radio-name">PNG (推荐)</span>
+                  <span class="radio-desc">无损高清，文字代码最锐利</span>
+                </div>
+              </label>
+              <label class="radio-item" data-value="jpeg">
+                <input type="radio" name="format" value="jpeg">
+                <div class="radio-content">
+                  <span class="radio-name">JPEG</span>
+                  <span class="radio-desc">文件体积小，适合长图分享</span>
+                </div>
+              </label>
+              <label class="radio-item" data-value="webp">
+                <input type="radio" name="format" value="webp">
+                <div class="radio-content">
+                  <span class="radio-name">WebP</span>
+                  <span class="radio-desc">现代高效压缩格式</span>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-group" id="qualityGroup">
+            <div class="label-with-value">
+              <label class="form-label" for="qualitySlider">压缩质量</label>
+              <span class="value-bubble" id="qualityValue">95%</span>
+            </div>
+            <input type="range" id="qualitySlider" min="50" max="100" step="5" value="95" class="range-slider">
+            <span class="field-hint">仅对 JPEG 和 WebP 格式生效</span>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">渲染分辨率倍率 (DPI 缩放)</label>
+            <div class="segmented-control" id="scaleControl">
+              <button type="button" class="segment-btn active" data-scale="1">1x 标准 (推荐)</button>
+              <button type="button" class="segment-btn" data-scale="2">2x Retina 超清</button>
+            </div>
+            <span class="field-hint">2x 分辨率会生成双倍像素的高清图（若页面过高将自动做防爆内存适配）</span>
+          </div>
+        </div>
+
+        <!-- Card 2: 捕获与交互 -->
+        <div class="card">
+          <h2 class="card-title">
+            <span class="card-icon">⚡</span>
+            捕获行为与交互
+          </h2>
+
+          <div class="switch-row">
+            <div class="switch-info">
+              <div class="switch-title">智能防空白图片预滚</div>
+              <div class="switch-desc">截屏前执行 150ms 极速扫描，激活小红书、知乎等懒加载（Lazy-load）图片</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="preScrollToggle">
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="switch-row">
+            <div class="switch-info">
+              <div class="switch-title">网页内动态提示胶囊 (Toast)</div>
+              <div class="switch-desc">截屏开始与完成时，在网页右上角浮现精致的毛玻璃动态状态提示</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="showToastToggle" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Card 3: 保存命名规则 -->
+        <div class="card">
+          <h2 class="card-title">
+            <span class="card-icon">📁</span>
+            文件下载与命名
+          </h2>
+
+          <div class="form-group">
+            <label class="form-label" for="filenamePattern">文件名模板</label>
+            <input type="text" id="filenamePattern" class="text-input" value="{title}_{date}_{time}">
+            <div class="tag-chips">
+              <span class="tag-chip" data-tag="{title}">{title} 网页标题</span>
+              <span class="tag-chip" data-tag="{domain}">{domain} 域名</span>
+              <span class="tag-chip" data-tag="{date}">{date} 日期</span>
+              <span class="tag-chip" data-tag="{time}">{time} 时间</span>
+            </div>
+            <div class="field-hint">点击标签可快速插入到模板中</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: Shortcuts & Quick Info -->
+      <aside class="info-col">
+        <!-- Quick Trigger Box -->
+        <div class="card highlight-card">
+          <h3 class="highlight-title">🚀 3 种极简长截屏触发方式</h3>
+          <ul class="trigger-list">
+            <li>
+              <div class="trigger-num">1</div>
+              <div class="trigger-text">
+                <strong>点击工具栏图标</strong>
+                <span>点一下插件图标，立刻在 300ms 内截好并下载！</span>
+              </div>
+            </li>
+            <li>
+              <div class="trigger-num">2</div>
+              <div class="trigger-text">
+                <strong>全局快捷键</strong>
+                <div class="kbd-wrap">
+                  <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd>
+                </div>
+                <span class="shortcut-tip">Mac 系统对应 <kbd>⌥</kbd> + <kbd>⇧</kbd> + <kbd>S</kbd></span>
+              </div>
+            </li>
+            <li>
+              <div class="trigger-num">3</div>
+              <div class="trigger-text">
+                <strong>鼠标右键菜单</strong>
+                <span>在页面任意位置右键选择「📸 一键全页长截屏」</span>
+              </div>
+            </li>
+          </ul>
+        </div>
+
+        <!-- DevTools Engine Advantage -->
+        <div class="card compare-card">
+          <h3 class="compare-title">💡 为什么 DevTools 原生截屏更好？</h3>
+          <div class="compare-item pro">
+            <div class="compare-badge">✅ 本插件 (DevTools 原生)</div>
+            <p>基于 Chrome 底层 GPU 渲染管线，页面顶部吸顶栏（Sticky Header）自然渲染一次，不产生切片重叠，无需等待屏幕慢慢向下滚动拼接。</p>
+          </div>
+          <div class="compare-item con">
+            <div class="compare-badge">❌ 传统拼接类插件</div>
+            <p>依靠不断执行 window.scrollBy 分段截图，悬浮导航栏会像千层饼一样重复出现，拼接缝隙容易撕裂文字或图片。</p>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
