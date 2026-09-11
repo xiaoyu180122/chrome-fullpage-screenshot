@@ -5,9 +5,9 @@
 
 const DEFAULT_SETTINGS = {
   format: 'png',
-  quality: 95,
-  scale: 1,
-  preScroll: false,
+  quality: 100,
+  scale: 'native',
+  preScroll: true,
   showToast: true,
   filenamePattern: '{title}_{date}_{time}'
 };
@@ -53,7 +53,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // Scale
     const scaleBtns = scaleControl.querySelectorAll('.segment-btn');
     scaleBtns.forEach(btn => {
-      if (Number(btn.dataset.scale) === Number(s.scale)) {
+      const btnScale = btn.dataset.scale;
+      if (String(btnScale) === String(s.scale)) {
         btn.classList.add('active');
       } else {
         btn.classList.remove('active');
@@ -125,7 +126,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!btn) return;
     scaleControl.querySelectorAll('.segment-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-    currentSettings.scale = Number(btn.dataset.scale);
+    const scaleVal = btn.dataset.scale;
+    currentSettings.scale = scaleVal === 'native' ? 'native' : Number(scaleVal);
     saveSettings();
   });
 

@@ -38,9 +38,9 @@ async function blobToDataUrl(blob) {
 
 // Default settings
 const DEFAULT_SETTINGS = {
-  format: 'png',        // 'png' | 'jpeg' | 'webp'
-  quality: 95,          // 0 - 100
-  scale: 1,             // 1 (Standard) or 2 (Retina 2x)
+  format: 'png',        // 'png' (100% 纯无损) | 'jpeg' | 'webp'
+  quality: 100,         // 100 (满画质零损耗)
+  scale: 'native',      // 'native' (匹配屏幕原生物理像素点对点) | 1 | 2
   preScroll: true,      // Automatically trigger lazy images by default
   showToast: true,      // In-page visual feedback after capture
   filenamePattern: '{title}_{date}_{time}'
@@ -252,6 +252,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
           return {
             width: Math.ceil(docWidth),
             height: Math.ceil(docHeight),
+            devicePixelRatio: window.devicePixelRatio || 1,
             origScrollX,
             origScrollY
           };
@@ -280,25 +281,31 @@ async function captureFullPage(tab, overrideOptions = {}) {
     const format = settings.format || 'png';
     const mime = format === 'jpeg' ? 'image/jpeg' : format === 'webp' ? 'image/webp' : 'image/png';
     const ext = format === 'jpeg' ? 'jpg' : format === 'webp' ? 'webp' : 'png';
-    const quality = Math.min(100, Math.max(10, settings.quality || 95));
+    const quality = Math.min(100, Math.max(10, settings.quality || 100));
+
+    // Calculate captureScale:
+    // 'native' or 'auto' means matching current display's physical devicePixelRatio (e.g. 1.25, 1.5, 2)
+    // to guarantee 100% pixel-to-pixel sharpness without downsampling
+    const screenDpr = (domMetrics && domMetrics.devicePixelRatio) || 1;
+    let captureScale = 1;
+    if (settings.scale === 'native' || settings.scale === 'auto' || !settings.scale) {
+      captureScale = screenDpr;
+    } else {
+      captureScale = Number(settings.scale) || 1;
+    }
 
     // =========================================================================
     // DUAL-ENGINE STRATEGY:
-    // Engine A: Single-Shot (height <= 16,000px) - Instant 1-shot capture (~300ms)
-    // Engine B: Ultra-Long Multi-Chunk Slicing (height > 16,000px, e.g. Comics) - No length limit!
+    // Engine A: Fast Single-Shot (physical height <= 14,000px) - Instant 1-shot capture (~300ms)
+    // Engine B: Ultra-Long Multi-Chunk Slicing (physical height > 14,000px) - No length limit!
     // =========================================================================
-    const SINGLE_SHOT_THRESHOLD = 12000;
+    const SINGLE_SHOT_MAX_PHYSICAL_HEIGHT = 14000;
     let savedPartsCount = 1;
 
-    if (finalHeight <= SINGLE_SHOT_THRESHOLD) {
+    if (finalHeight * captureScale <= SINGLE_SHOT_MAX_PHYSICAL_HEIGHT) {
       // -----------------------------------------------------------------------
       // ENGINE A: Fast Single-Shot Path
       // -----------------------------------------------------------------------
-      let captureScale = settings.scale || 1;
-      if (finalHeight * captureScale > 16384) {
-        captureScale = 1;
-      }
-
       await sendCdp(debuggee, "Emulation.setDeviceMetricsOverride", {
         width: finalWidth,
         height: finalHeight,
@@ -313,7 +320,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
         const updatedMetrics = await sendCdp(debuggee, "Page.getLayoutMetrics");
         const updatedSize = updatedMetrics.cssContentSize || updatedMetrics.contentSize || {};
         const updatedHeight = Math.ceil(updatedSize.height || 0);
-        if (updatedHeight > finalHeight && updatedHeight <= SINGLE_SHOT_THRESHOLD) {
+        if (updatedHeight > finalHeight && (updatedHeight * captureScale) <= SINGLE_SHOT_MAX_PHYSICAL_HEIGHT) {
           finalHeight = updatedHeight;
           await sendCdp(debuggee, "Emulation.setDeviceMetricsOverride", {
             width: finalWidth,
@@ -368,12 +375,12 @@ async function captureFullPage(tab, overrideOptions = {}) {
       let chunkIndex = 0;
       let isAtBottom = false;
 
-      // Keep viewport fixed at CHUNK_HEIGHT throughout Engine B
+      // Keep viewport fixed at CHUNK_HEIGHT throughout Engine B with full physical DPI
       const chunkViewportHeight = Math.min(finalHeight, CHUNK_HEIGHT);
       await sendCdp(debuggee, "Emulation.setDeviceMetricsOverride", {
         width: finalWidth,
         height: chunkViewportHeight,
-        deviceScaleFactor: 1,
+        deviceScaleFactor: captureScale,
         mobile: false
       });
       hasOverriddenMetrics = true;
@@ -475,7 +482,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
       // -----------------------------------------------------------------------
       // STITCHING & MULTI-PART PARTITIONING:
       // Chrome's convertToBlob on OffscreenCanvas has a strict 16-bit uint16_t
-      // limit (65,535px). If height exceeds 60,000px, we partition the output
+      // limit (65,535px). If physical height exceeds 60,000px, we partition the output
       // into sequential crystal-clear parts (_第1卷, _第2卷, etc.)
       // -----------------------------------------------------------------------
       setActionBadge(tabId, '拼装', '#8b5cf6');
@@ -518,17 +525,21 @@ async function captureFullPage(tab, overrideOptions = {}) {
       }
 
       const totalStitchedHeight = Math.max(drawnUpToY, finalHeight);
-      const MAX_CANVAS_SAFE_HEIGHT = 60000;
+      const MAX_CANVAS_SAFE_HEIGHT = Math.floor(60000 / captureScale);
       const partCount = Math.ceil(totalStitchedHeight / MAX_CANVAS_SAFE_HEIGHT);
       savedPartsCount = partCount;
+
+      const physicalWidth = Math.round(finalWidth * captureScale);
 
       for (let p = 0; p < partCount; p++) {
         const partStartY = p * MAX_CANVAS_SAFE_HEIGHT;
         const partEndY = Math.min(totalStitchedHeight, (p + 1) * MAX_CANVAS_SAFE_HEIGHT);
         const partHeight = partEndY - partStartY;
+        const physicalPartHeight = Math.round(partHeight * captureScale);
 
-        const canvas = new OffscreenCanvas(finalWidth, partHeight);
+        const canvas = new OffscreenCanvas(physicalWidth, physicalPartHeight);
         const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = false; // Disable interpolation for 100% bit-exact pixel transfer
 
         // Draw resolved slices onto this part's canvas
         for (const slice of resolvedSlices) {
@@ -550,11 +561,16 @@ async function captureFullPage(tab, overrideOptions = {}) {
             const blob = await resp.blob();
             const bitmap = await createImageBitmap(blob);
 
-            // Draw with precise sub-rectangle cropping
+            // Draw with precise sub-rectangle cropping in physical pixels
+            const sY = Math.round(finalSrcY * captureScale);
+            const sH = Math.round(visibleHeight * captureScale);
+            const dY = Math.round(finalDestY * captureScale);
+            const dW = physicalWidth;
+
             ctx.drawImage(
               bitmap,
-              0, finalSrcY, finalWidth, visibleHeight,
-              0, finalDestY, finalWidth, visibleHeight
+              0, sY, dW, sH,
+              0, dY, dW, sH
             );
             bitmap.close();
           }
@@ -599,9 +615,12 @@ async function captureFullPage(tab, overrideOptions = {}) {
 
     // Show toast ONLY AFTER capture and download is complete (never in the screenshot!)
     if (settings.showToast) {
+      const pixelW = Math.round(finalWidth * captureScale);
+      const pixelH = Math.round(finalHeight * captureScale);
+      const dprTag = captureScale > 1 ? ` · ${captureScale}x 超清原画` : ' · 100% 纯无损原画';
       const subtitle = savedPartsCount > 1
-        ? `${finalWidth}×${finalHeight}px · 超长页面已自动分 ${savedPartsCount} 卷原画保存到底`
-        : `${finalWidth}×${finalHeight}px · 已无限制截到底`;
+        ? `${pixelW}×${pixelH}px${dprTag} · 超长页面已自动分 ${savedPartsCount} 卷纯原画保存到底`
+        : `${pixelW}×${pixelH}px${dprTag} · 100% 原始画质无压缩截到底`;
 
       sendToast(tabId, {
         status: 'success',

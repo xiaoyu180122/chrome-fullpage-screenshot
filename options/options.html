@@ -67,20 +67,21 @@
 
           <div class="form-group" id="qualityGroup">
             <div class="label-with-value">
-              <label class="form-label" for="qualitySlider">压缩质量</label>
-              <span class="value-bubble" id="qualityValue">95%</span>
+              <label class="form-label" for="qualitySlider">压缩质量 (仅 JPEG/WebP)</label>
+              <span class="value-bubble" id="qualityValue">100%</span>
             </div>
-            <input type="range" id="qualitySlider" min="50" max="100" step="5" value="95" class="range-slider">
-            <span class="field-hint">仅对 JPEG 和 WebP 格式生效</span>
+            <input type="range" id="qualitySlider" min="50" max="100" step="5" value="100" class="range-slider">
+            <span class="field-hint">PNG 格式为 100% 纯无损（Lossless）格式，天然不压缩任何画质；此项仅用于 JPEG/WebP</span>
           </div>
 
           <div class="form-group">
-            <label class="form-label">渲染分辨率倍率 (DPI 缩放)</label>
+            <label class="form-label">渲染清晰度与分辨率倍率 (DPI 缩放)</label>
             <div class="segmented-control" id="scaleControl">
-              <button type="button" class="segment-btn active" data-scale="1">1x 标准 (推荐)</button>
+              <button type="button" class="segment-btn" data-scale="1">1x 标准点对点</button>
+              <button type="button" class="segment-btn active" data-scale="native">💻 原屏物理DPI (推荐)</button>
               <button type="button" class="segment-btn" data-scale="2">2x Retina 超清</button>
             </div>
-            <span class="field-hint">2x 分辨率会生成双倍像素的高清图（若页面过高将自动做防爆内存适配）</span>
+            <span class="field-hint">默认导出 100% 原始无损 PNG。开启「原屏物理DPI」将自动匹配 Windows 屏幕缩放比（如 125%/150%），消除放大查看时的发虚现象</span>
           </div>
         </div>
 
