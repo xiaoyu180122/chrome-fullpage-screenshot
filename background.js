@@ -138,8 +138,10 @@ async function captureFullPage(tab, overrideOptions = {}) {
   const url = tab.url || '';
 
   // 1. Check if URL is supported
-  const unsupportedProtocols = ['chrome:', 'chrome-extension:', 'edge:', 'about:', 'view-source:', 'devtools:'];
-  const isInternal = unsupportedProtocols.some(p => url.startsWith(p)) || url.startsWith('https://chromewebstore.google.com');
+  const unsupportedProtocols = ['chrome:', 'chrome-extension:', 'edge:', 'edge-extension:', 'extension:', 'about:', 'view-source:', 'devtools:'];
+  const isInternal = unsupportedProtocols.some(p => url.startsWith(p))
+    || url.startsWith('https://chromewebstore.google.com')
+    || url.startsWith('https://microsoftedge.microsoft.com');
 
   if (isInternal) {
     setActionBadge(tabId, 'ERR', '#ef4444');
@@ -147,7 +149,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
     sendToast(tabId, {
       status: 'error',
       title: '无法截取系统页面',
-      subtitle: 'Chrome 安全策略禁止在内部系统页及应用商店执行截屏'
+      subtitle: '浏览器安全策略禁止在内部系统页及应用商店执行截屏'
     });
     return;
   }
