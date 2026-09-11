@@ -1,10 +1,10 @@
 /**
  * Chrome Full Page Screenshot Extension - Background Service Worker
- * Powered by Chrome DevTools Protocol (CDP) Page.captureScreenshot + Emulation
- * Fixes:
- * 1. Zero in-page obstruction (No toast injected before/during screenshot; badge indicator only)
- * 2. Complete full-page rendering without viewport repetition or tiling (Emulation.setDeviceMetricsOverride)
- * 3. Sticky header deduplication and automatic scroll restoration
+ * Powered by Chrome DevTools Protocol (CDP) + Dual-Engine Architecture:
+ * 1. Single-Shot Native Engine (for pages <= 16,000px): Lightning-fast 1-shot capture
+ * 2. Ultra-Long Multi-Chunk Slicing Engine (for pages > 16,000px, e.g. Comics/Webtoons):
+ *    Captures all the way to the bottom without any height limit, stitches on OffscreenCanvas,
+ *    and deduplicates sticky/fixed navigation bars.
  */
 
 // Helper to wrap chrome.debugger.sendCommand in Promise
@@ -17,6 +17,19 @@ function sendCdp(debuggee, method, params = {}) {
       resolve(result || {});
     });
   });
+}
+
+// Convert Blob to Data URL in Service Worker without DOM dependencies
+async function blobToDataUrl(blob) {
+  const buffer = await blob.arrayBuffer();
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  const CHUNK_SIZE = 0x8000;
+  for (let i = 0; i < len; i += CHUNK_SIZE) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK_SIZE));
+  }
+  return `data:${blob.type};base64,${btoa(binary)}`;
 }
 
 // Default settings
@@ -83,7 +96,7 @@ function buildFilename(tab, settings, ext) {
   return `${filename}.${ext}`;
 }
 
-// Send Toast only AFTER capture is complete to guarantee NO in-page obstruction
+// Send Toast ONLY AFTER capture is completely finished to guarantee NO in-page obstruction
 async function sendToast(tabId, payload) {
   try {
     await chrome.scripting.executeScript({
@@ -107,7 +120,7 @@ function setActionBadge(tabId, text, color) {
   }
 }
 
-function clearActionBadge(tabId, delay = 2000) {
+function clearActionBadge(tabId, delay = 2200) {
   setTimeout(() => {
     chrome.action.setBadgeText({ text: '', tabId });
   }, delay);
@@ -175,13 +188,13 @@ async function captureFullPage(tab, overrideOptions = {}) {
             window.innerHeight || 800
           );
 
-          // Check for inner scrollable containers (e.g. Single Page Apps with height: 100vh; overflow-y: auto)
-          const containers = document.querySelectorAll('div, main, section, article, #app, #root');
-          for (let i = 0; i < Math.min(containers.length, 50); i++) {
+          // Check for inner scrollable containers (e.g. Manga/Webtoon reader, SPA scroll containers)
+          const containers = document.querySelectorAll('div, main, section, article, #app, #root, .reader, .comic-view, .viewer');
+          for (let i = 0; i < Math.min(containers.length, 80); i++) {
             const el = containers[i];
             if (el.scrollHeight > docHeight && el.scrollHeight > window.innerHeight) {
               const style = window.getComputedStyle(el);
-              if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+              if (style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflow === 'visible') {
                 docHeight = Math.max(docHeight, el.scrollHeight);
               }
             }
@@ -190,6 +203,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
           return {
             width: Math.ceil(docWidth),
             height: Math.ceil(docHeight),
+            windowHeight: window.innerHeight,
             origScrollX,
             origScrollY
           };
@@ -207,8 +221,8 @@ async function captureFullPage(tab, overrideOptions = {}) {
           target: { tabId },
           func: async () => {
             const originalScrollY = window.scrollY;
-            const scrollStep = Math.max(window.innerHeight, 600);
-            const maxScroll = Math.min(document.body.scrollHeight, 12000);
+            const scrollStep = Math.max(window.innerHeight, 800);
+            const maxScroll = Math.min(document.body.scrollHeight, 100000);
             for (let y = 0; y < maxScroll; y += scrollStep) {
               window.scrollTo(0, y);
               await new Promise(r => setTimeout(r, 40));
@@ -219,7 +233,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
         });
       } catch (err) {}
     } else {
-      // Ensure page is scrolled to top so headers, fixed elements and coordinates start at (0, 0)
+      // Ensure page starts at top
       try {
         await chrome.scripting.executeScript({
           target: { tabId },
@@ -243,19 +257,29 @@ async function captureFullPage(tab, overrideOptions = {}) {
     let finalWidth = Math.max((domMetrics && domMetrics.width) || 0, cWidth, 1280);
     let finalHeight = Math.max((domMetrics && domMetrics.height) || 0, cHeight, 800);
 
-    // Guard against Chrome GPU limit (16,384px)
-    let captureScale = settings.scale || 1;
-    if (finalHeight * captureScale > 16384) {
-      captureScale = Math.max(1, Math.floor(16384 / finalHeight));
-      if (finalHeight > 16384) {
-        finalHeight = 16384;
-      }
-    }
+    const format = settings.format || 'png';
+    const mime = format === 'jpeg' ? 'image/jpeg' : format === 'webp' ? 'image/webp' : 'image/png';
+    const ext = format === 'jpeg' ? 'jpg' : format === 'webp' ? 'webp' : 'png';
+    const quality = Math.min(100, Math.max(10, settings.quality || 95));
 
-    // 5. CRITICAL FIX: Set Emulation device metrics override
-    // This expands the actual viewport to the document height, completely preventing
-    // the Chrome compositor from tiling/repeating the visible screen!
-    try {
+    let finalDataUrl = '';
+
+    // =========================================================================
+    // DUAL-ENGINE STRATEGY:
+    // Engine A: Single-Shot (height <= 16,000px) - Instant 1-shot capture (~300ms)
+    // Engine B: Ultra-Long Multi-Chunk Slicing (height > 16,000px, e.g. Comics) - No length limit!
+    // =========================================================================
+    const SINGLE_SHOT_THRESHOLD = 16000;
+
+    if (finalHeight <= SINGLE_SHOT_THRESHOLD) {
+      // -----------------------------------------------------------------------
+      // ENGINE A: Fast Single-Shot Path
+      // -----------------------------------------------------------------------
+      let captureScale = settings.scale || 1;
+      if (finalHeight * captureScale > 16384) {
+        captureScale = 1;
+      }
+
       await sendCdp(debuggee, "Emulation.setDeviceMetricsOverride", {
         width: finalWidth,
         height: finalHeight,
@@ -263,42 +287,142 @@ async function captureFullPage(tab, overrideOptions = {}) {
         mobile: false
       });
       hasOverriddenMetrics = true;
-      // Wait a moment for Chrome compositor to re-render the full layout
       await new Promise(r => setTimeout(r, 260));
-    } catch (emulationErr) {
-      console.warn("setDeviceMetricsOverride fallback:", emulationErr);
-    }
 
-    // 6. Capture Screenshot via CDP
-    const format = settings.format || 'png';
-    const screenshotParams = {
-      format: format,
-      fromSurface: true,
-      captureBeyondViewport: !hasOverriddenMetrics
-    };
-
-    if (!hasOverriddenMetrics) {
-      // Fallback clip if emulation override was rejected
-      screenshotParams.clip = {
-        x: 0,
-        y: 0,
-        width: finalWidth,
-        height: finalHeight,
-        scale: captureScale
+      const screenshotParams = {
+        format: format,
+        fromSurface: true,
+        captureBeyondViewport: false
       };
+      if (format === 'jpeg' || format === 'webp') {
+        screenshotParams.quality = quality;
+      }
+
+      const screenshotResult = await sendCdp(debuggee, "Page.captureScreenshot", screenshotParams);
+      if (!screenshotResult || !screenshotResult.data) {
+        throw new Error("未能获取到截屏数据");
+      }
+      finalDataUrl = `data:${mime};base64,${screenshotResult.data}`;
+
+    } else {
+      // -----------------------------------------------------------------------
+      // ENGINE B: Ultra-Long Multi-Chunk Slicing Engine (NO HEIGHT LIMIT!)
+      // Slices the page in blocks of 8,000px, hides fixed elements for chunks > 0,
+      // and stitches them seamlessly on high-capacity OffscreenCanvas.
+      // -----------------------------------------------------------------------
+      const CHUNK_HEIGHT = 8000;
+      const chunks = [];
+      let currentY = 0;
+      let chunkIndex = 0;
+
+      while (currentY < finalHeight) {
+        const remaining = finalHeight - currentY;
+        const currentChunkHeight = Math.min(CHUNK_HEIGHT, remaining);
+
+        // Update badge to show live progress (e.g. "1/4", "2/4")
+        const estTotalChunks = Math.ceil(finalHeight / CHUNK_HEIGHT);
+        setActionBadge(tabId, `${chunkIndex + 1}/${estTotalChunks}`, '#2563eb');
+
+        // Scroll to chunk offset & hide sticky/fixed elements after chunk 0
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (y, isFirstChunk) => {
+            window.scrollTo(0, y);
+            if (!isFirstChunk) {
+              document.querySelectorAll('*').forEach(el => {
+                const style = window.getComputedStyle(el);
+                if (style.position === 'fixed' || style.position === 'sticky') {
+                  if (!el.dataset.fullpageOrigVis) {
+                    el.dataset.fullpageOrigVis = el.style.visibility || 'visible';
+                  }
+                  el.style.visibility = 'hidden';
+                }
+              });
+            }
+          },
+          args: [currentY, chunkIndex === 0]
+        });
+
+        // Set device metrics override for current chunk slice
+        await sendCdp(debuggee, "Emulation.setDeviceMetricsOverride", {
+          width: finalWidth,
+          height: currentChunkHeight,
+          deviceScaleFactor: 1,
+          mobile: false
+        });
+        hasOverriddenMetrics = true;
+
+        // Wait 150ms for images and layout in the new slice to render
+        await new Promise(r => setTimeout(r, 160));
+
+        // Check if page height dynamically expanded (infinite scroll / lazy loading webtoon)
+        try {
+          const [heightCheck] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: () => Math.max(
+              document.documentElement.scrollHeight,
+              document.body.scrollHeight,
+              document.documentElement.offsetHeight
+            )
+          });
+          if (heightCheck && heightCheck.result > finalHeight) {
+            finalHeight = heightCheck.result;
+          }
+        } catch (e) {}
+
+        const chunkShot = await sendCdp(debuggee, "Page.captureScreenshot", {
+          format: 'png',
+          fromSurface: true,
+          captureBeyondViewport: false
+        });
+
+        if (chunkShot && chunkShot.data) {
+          chunks.push({
+            data: chunkShot.data,
+            y: currentY,
+            width: finalWidth,
+            height: currentChunkHeight
+          });
+        }
+
+        currentY += currentChunkHeight;
+        chunkIndex++;
+      }
+
+      // Restore hidden fixed and sticky elements
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => {
+            document.querySelectorAll('[data-fullpage-orig-vis]').forEach(el => {
+              el.style.visibility = el.dataset.fullpageOrigVis === 'visible' ? '' : el.dataset.fullpageOrigVis;
+              delete el.dataset.fullpageOrigVis;
+            });
+          }
+        });
+      } catch (e) {}
+
+      // Stitch chunks onto an OffscreenCanvas
+      setActionBadge(tabId, '拼接', '#8b5cf6');
+      const canvas = new OffscreenCanvas(finalWidth, finalHeight);
+      const ctx = canvas.getContext('2d');
+
+      for (const chunk of chunks) {
+        const resp = await fetch(`data:image/png;base64,${chunk.data}`);
+        const blob = await resp.blob();
+        const bitmap = await createImageBitmap(blob);
+        ctx.drawImage(bitmap, 0, chunk.y, chunk.width, chunk.height);
+        bitmap.close();
+      }
+
+      const finalBlob = await canvas.convertToBlob({
+        type: mime,
+        quality: (format === 'jpeg' || format === 'webp') ? (quality / 100) : undefined
+      });
+      finalDataUrl = await blobToDataUrl(finalBlob);
     }
 
-    if (format === 'jpeg' || format === 'webp') {
-      screenshotParams.quality = Math.min(100, Math.max(10, settings.quality || 95));
-    }
-
-    const screenshotResult = await sendCdp(debuggee, "Page.captureScreenshot", screenshotParams);
-
-    if (!screenshotResult || !screenshotResult.data) {
-      throw new Error("未能获取到截屏数据");
-    }
-
-    // 7. Clear Device Metrics Override & Restore Scroll
+    // 5. Clear Device Metrics Override & Restore User Scroll Position
     if (hasOverriddenMetrics) {
       try {
         await sendCdp(debuggee, "Emulation.clearDeviceMetricsOverride");
@@ -306,7 +430,6 @@ async function captureFullPage(tab, overrideOptions = {}) {
       } catch (e) {}
     }
 
-    // Restore original scroll position
     if (domMetrics && (domMetrics.origScrollX || domMetrics.origScrollY)) {
       try {
         await chrome.scripting.executeScript({
@@ -317,29 +440,24 @@ async function captureFullPage(tab, overrideOptions = {}) {
       } catch (e) {}
     }
 
-    // 8. Build Image Data URL & Filename
-    const mime = format === 'jpeg' ? 'image/jpeg' : format === 'webp' ? 'image/webp' : 'image/png';
-    const ext = format === 'jpeg' ? 'jpg' : format === 'webp' ? 'webp' : 'png';
-    const dataUrl = `data:${mime};base64,${screenshotResult.data}`;
+    // 6. Build Filename and Trigger Download
     const filename = buildFilename(tab, settings, ext);
-
-    // 9. Trigger Download
     await chrome.downloads.download({
-      url: dataUrl,
+      url: finalDataUrl,
       filename: filename,
       saveAs: false
     });
 
-    // 10. Success Feedback: Badge on Toolbar
+    // 7. Success Feedback: Badge on Toolbar
     setActionBadge(tabId, '✓', '#10b981');
-    clearActionBadge(tabId, 2200);
+    clearActionBadge(tabId, 2500);
 
-    // Show toast ONLY AFTER capture is complete (never in the screenshot!)
+    // Show toast ONLY AFTER capture and download is complete (never in the screenshot!)
     if (settings.showToast) {
       sendToast(tabId, {
         status: 'success',
         title: '长截屏已保存成功！',
-        subtitle: `${finalWidth}×${finalHeight}px · 已下载至保存目录`
+        subtitle: `${finalWidth}×${finalHeight}px · 已无限制截到底`
       });
     }
 
@@ -359,7 +477,6 @@ async function captureFullPage(tab, overrideOptions = {}) {
       subtitle: errorMsg
     });
   } finally {
-    // Ensure clean state: clear device metrics and detach debugger
     if (hasOverriddenMetrics) {
       try {
         await sendCdp(debuggee, "Emulation.clearDeviceMetricsOverride");
@@ -394,7 +511,7 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({
       id: 'fullpage_capture_normal',
-      title: '📸 一键全页长截屏 (DevTools 原生)',
+      title: '📸 一键全页长截屏 (无长度限制)',
       contexts: ['page']
     });
     chrome.contextMenus.create({
