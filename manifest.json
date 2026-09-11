@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "一键长截屏 - Chrome/Edge原生全尺寸截图",
   "short_name": "一键长截屏",
-  "version": "1.4.0",
+  "version": "1.4.2",
   "description": "基于 Chrome / Edge (Chromium) DevTools 原生底层引擎，点击一下直接保存全网页超高清长图，彻底告别吸顶栏重复与断层，免开 F12 控制台。",
   "author": "Antigravity Engineering",
   "permissions": [

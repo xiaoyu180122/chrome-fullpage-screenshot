@@ -176,7 +176,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
           const origScrollX = window.scrollX || window.pageXOffset || 0;
           const origScrollY = window.scrollY || window.pageYOffset || 0;
 
-          // 1. Inject override style to disable content-visibility: auto and force rendering
+          // 1. Inject override style to disable content-visibility: auto and force instant scrolling
           const styleId = '__fullpage_override_style__';
           let styleEl = document.getElementById(styleId);
           if (!styleEl) {
@@ -186,6 +186,10 @@ async function captureFullPage(tab, overrideOptions = {}) {
               * {
                 content-visibility: visible !important;
                 contain-intrinsic-size: auto !important;
+                scroll-behavior: auto !important;
+              }
+              html, body {
+                scroll-behavior: auto !important;
               }
             `;
             document.documentElement.appendChild(styleEl);
@@ -199,11 +203,21 @@ async function captureFullPage(tab, overrideOptions = {}) {
           );
           const step = Math.max(window.innerHeight * 1.5, 1200);
           for (let y = 0; y < Math.min(totalEstimate, 120000); y += step) {
-            window.scrollTo(0, y);
+            window.scrollTo({ left: 0, top: y, behavior: 'instant' });
+            if (document.documentElement) document.documentElement.scrollTop = y;
+            if (document.body) document.body.scrollTop = y;
+            await new Promise(r => setTimeout(r, 20));
+          }
+
+          // Snap back to top instantly
+          window.scrollTo({ left: 0, top: 0, behavior: 'instant' });
+          if (document.documentElement) document.documentElement.scrollTop = 0;
+          if (document.body) document.body.scrollTop = 0;
+          if (document.scrollingElement) document.scrollingElement.scrollTop = 0;
+          for (let i = 0; i < 10; i++) {
+            if ((window.scrollY || 0) === 0) break;
             await new Promise(r => setTimeout(r, 25));
           }
-          window.scrollTo(0, 0);
-          await new Promise(r => setTimeout(r, 100));
 
           // 3. Calculate true full dimensions
           const doc = document.documentElement;
@@ -388,6 +402,18 @@ async function captureFullPage(tab, overrideOptions = {}) {
       hasOverriddenMetrics = true;
       await new Promise(r => setTimeout(r, 150));
 
+      // Reset scroll to 0 after device metrics override to guarantee chunk 0 starts from top!
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => {
+          window.scrollTo({ left: 0, top: 0, behavior: 'instant' });
+          if (document.documentElement) document.documentElement.scrollTop = 0;
+          if (document.body) document.body.scrollTop = 0;
+          if (document.scrollingElement) document.scrollingElement.scrollTop = 0;
+        }
+      });
+      await new Promise(r => setTimeout(r, 80));
+
       while (!isAtBottom && targetY <= finalHeight + CHUNK_HEIGHT) {
         // Update badge to show live progress (e.g. "1/4", "2/4")
         const estTotalChunks = Math.max(1, Math.ceil(finalHeight / CHUNK_HEIGHT));
@@ -396,8 +422,12 @@ async function captureFullPage(tab, overrideOptions = {}) {
         // Scroll to target offset & hide sticky/fixed elements after chunk 0
         const [scrollRes] = await chrome.scripting.executeScript({
           target: { tabId },
-          func: (y, isFirst) => {
-            window.scrollTo(0, y);
+          func: async (y, isFirst) => {
+            window.scrollTo({ left: 0, top: y, behavior: 'instant' });
+            if (document.documentElement) document.documentElement.scrollTop = y;
+            if (document.body) document.body.scrollTop = y;
+            if (document.scrollingElement) document.scrollingElement.scrollTop = y;
+
             if (!isFirst) {
               const selectors = 'header, nav, aside, [class*="header"], [class*="nav"], [class*="sticky"], [class*="fixed"], [class*="top"]';
               document.querySelectorAll(selectors).forEach(el => {
@@ -410,6 +440,10 @@ async function captureFullPage(tab, overrideOptions = {}) {
                 }
               });
             }
+
+            // Small delay for DOM layout coordinate reflection
+            await new Promise(r => setTimeout(r, 40));
+
             return {
               scrollY: window.scrollY || window.pageYOffset || 0,
               scrollHeight: Math.max(
@@ -422,17 +456,22 @@ async function captureFullPage(tab, overrideOptions = {}) {
           args: [targetY, chunkIndex === 0]
         });
 
-        const actualY = (scrollRes && scrollRes.result && scrollRes.result.scrollY !== undefined)
+        // For chunk 0, strictly enforce 0 anchor so top is never cut off
+        let actualY = (scrollRes && scrollRes.result && scrollRes.result.scrollY !== undefined)
           ? scrollRes.result.scrollY
           : targetY;
+
+        if (chunkIndex === 0 && actualY !== 0) {
+          actualY = 0;
+        }
 
         const liveScrollHeight = (scrollRes && scrollRes.result && scrollRes.result.scrollHeight) || finalHeight;
         if (liveScrollHeight > finalHeight) {
           finalHeight = liveScrollHeight;
         }
 
-        // Wait 220ms for comic images and lazy layout in the new slice to render
-        await new Promise(r => setTimeout(r, 220));
+        // Wait 250ms for comic images and lazy layout in the new slice to render
+        await new Promise(r => setTimeout(r, 250));
 
         const chunkShot = await sendCdp(debuggee, "Page.captureScreenshot", {
           format: 'png',
@@ -449,9 +488,12 @@ async function captureFullPage(tab, overrideOptions = {}) {
         }
 
         // Check if we've reached the bottom of the page:
-        // 1. Viewport bottom reached or exceeded document height
+        // 1. Viewport bottom reached or exceeded document height (must not break prematurely on chunk 0 unless short page)
         // 2. Or subsequent scroll didn't move downwards (browser clamped to maxScroll)
-        if (actualY + chunkViewportHeight >= finalHeight || (chunkIndex > 0 && actualY <= (chunks[chunks.length - 2]?.actualY ?? -1))) {
+        const reachedBottom = (actualY + chunkViewportHeight >= finalHeight);
+        const stuck = (chunkIndex > 0 && actualY <= (chunks[chunks.length - 2]?.actualY ?? -1));
+
+        if (stuck || (reachedBottom && (chunkIndex > 0 || finalHeight <= chunkViewportHeight))) {
           isAtBottom = true;
           break;
         }
@@ -495,7 +537,8 @@ async function captureFullPage(tab, overrideOptions = {}) {
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
-        const actualY = chunk.actualY;
+        // Critical safety: Chunk 0 MUST anchor at 0 so no top gap/transparency is ever left!
+        const actualY = i === 0 ? 0 : chunk.actualY;
         const h = chunk.height;
 
         if (actualY + h <= drawnUpToY) {
