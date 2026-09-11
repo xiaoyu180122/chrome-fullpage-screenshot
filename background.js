@@ -287,7 +287,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
     // Engine A: Single-Shot (height <= 16,000px) - Instant 1-shot capture (~300ms)
     // Engine B: Ultra-Long Multi-Chunk Slicing (height > 16,000px, e.g. Comics) - No length limit!
     // =========================================================================
-    const SINGLE_SHOT_THRESHOLD = 16000;
+    const SINGLE_SHOT_THRESHOLD = 12000;
     let savedPartsCount = 1;
 
     if (finalHeight <= SINGLE_SHOT_THRESHOLD) {
@@ -328,7 +328,14 @@ async function captureFullPage(tab, overrideOptions = {}) {
       const screenshotParams = {
         format: format,
         fromSurface: true,
-        captureBeyondViewport: true // Capture all the way to bottom even if layout expands slightly
+        captureBeyondViewport: true,
+        clip: {
+          x: 0,
+          y: 0,
+          width: finalWidth,
+          height: finalHeight,
+          scale: captureScale
+        }
       };
       if (format === 'jpeg' || format === 'webp') {
         screenshotParams.quality = quality;
@@ -351,31 +358,42 @@ async function captureFullPage(tab, overrideOptions = {}) {
     } else {
       // -----------------------------------------------------------------------
       // ENGINE B: Ultra-Long Multi-Chunk Slicing Engine (NO HEIGHT LIMIT!)
-      // Slices the page into safe blocks of 8,000px, hides fixed elements for chunks > 0,
-      // and stitches them onto OffscreenCanvas without uint16_t (65,535px) overflow!
+      // Slices the page into safe blocks of 5,000px, hides fixed elements for chunks > 0,
+      // tracks TRUE window.scrollY after every scroll step, and uses mathematical
+      // overlap-cropping on canvas to guarantee ZERO duplication and ZERO gaps!
       // -----------------------------------------------------------------------
-      const CHUNK_HEIGHT = 8000;
+      const CHUNK_HEIGHT = 5000;
       const chunks = [];
-      let currentY = 0;
+      let targetY = 0;
       let chunkIndex = 0;
+      let isAtBottom = false;
 
-      while (currentY < finalHeight) {
-        const remaining = finalHeight - currentY;
-        const currentChunkHeight = Math.min(CHUNK_HEIGHT, remaining);
+      // Keep viewport fixed at CHUNK_HEIGHT throughout Engine B
+      const chunkViewportHeight = Math.min(finalHeight, CHUNK_HEIGHT);
+      await sendCdp(debuggee, "Emulation.setDeviceMetricsOverride", {
+        width: finalWidth,
+        height: chunkViewportHeight,
+        deviceScaleFactor: 1,
+        mobile: false
+      });
+      hasOverriddenMetrics = true;
+      await new Promise(r => setTimeout(r, 150));
 
-        // Update badge to show live progress (e.g. "1/5", "2/5")
-        const estTotalChunks = Math.ceil(finalHeight / CHUNK_HEIGHT);
+      while (!isAtBottom && targetY <= finalHeight + CHUNK_HEIGHT) {
+        // Update badge to show live progress (e.g. "1/4", "2/4")
+        const estTotalChunks = Math.max(1, Math.ceil(finalHeight / CHUNK_HEIGHT));
         setActionBadge(tabId, `${chunkIndex + 1}/${estTotalChunks}`, '#2563eb');
 
-        // Scroll to chunk offset & hide sticky/fixed elements after chunk 0
-        await chrome.scripting.executeScript({
+        // Scroll to target offset & hide sticky/fixed elements after chunk 0
+        const [scrollRes] = await chrome.scripting.executeScript({
           target: { tabId },
-          func: (y, isFirstChunk) => {
+          func: (y, isFirst) => {
             window.scrollTo(0, y);
-            if (!isFirstChunk) {
-              document.querySelectorAll('*').forEach(el => {
-                const style = window.getComputedStyle(el);
-                if (style.position === 'fixed' || style.position === 'sticky') {
+            if (!isFirst) {
+              const selectors = 'header, nav, aside, [class*="header"], [class*="nav"], [class*="sticky"], [class*="fixed"], [class*="top"]';
+              document.querySelectorAll(selectors).forEach(el => {
+                const s = window.getComputedStyle(el);
+                if (s.position === 'fixed' || s.position === 'sticky') {
                   if (!el.dataset.fullpageOrigVis) {
                     el.dataset.fullpageOrigVis = el.style.visibility || 'visible';
                   }
@@ -383,36 +401,29 @@ async function captureFullPage(tab, overrideOptions = {}) {
                 }
               });
             }
+            return {
+              scrollY: window.scrollY || window.pageYOffset || 0,
+              scrollHeight: Math.max(
+                document.documentElement.scrollHeight,
+                document.body ? document.body.scrollHeight : 0,
+                document.documentElement.offsetHeight
+              )
+            };
           },
-          args: [currentY, chunkIndex === 0]
+          args: [targetY, chunkIndex === 0]
         });
 
-        // Set device metrics override for current chunk slice
-        await sendCdp(debuggee, "Emulation.setDeviceMetricsOverride", {
-          width: finalWidth,
-          height: currentChunkHeight,
-          deviceScaleFactor: 1,
-          mobile: false
-        });
-        hasOverriddenMetrics = true;
+        const actualY = (scrollRes && scrollRes.result && scrollRes.result.scrollY !== undefined)
+          ? scrollRes.result.scrollY
+          : targetY;
 
-        // Wait 220ms for comic images and layout in the new slice to render
+        const liveScrollHeight = (scrollRes && scrollRes.result && scrollRes.result.scrollHeight) || finalHeight;
+        if (liveScrollHeight > finalHeight) {
+          finalHeight = liveScrollHeight;
+        }
+
+        // Wait 220ms for comic images and lazy layout in the new slice to render
         await new Promise(r => setTimeout(r, 220));
-
-        // Check if page height dynamically expanded (infinite scroll / lazy loading webtoon)
-        try {
-          const [heightCheck] = await chrome.scripting.executeScript({
-            target: { tabId },
-            func: () => Math.max(
-              document.documentElement.scrollHeight,
-              document.body.scrollHeight,
-              document.documentElement.offsetHeight
-            )
-          });
-          if (heightCheck && heightCheck.result > finalHeight) {
-            finalHeight = heightCheck.result;
-          }
-        } catch (e) {}
 
         const chunkShot = await sendCdp(debuggee, "Page.captureScreenshot", {
           format: 'png',
@@ -423,13 +434,20 @@ async function captureFullPage(tab, overrideOptions = {}) {
         if (chunkShot && chunkShot.data) {
           chunks.push({
             data: chunkShot.data,
-            y: currentY,
-            width: finalWidth,
-            height: currentChunkHeight
+            actualY: actualY,
+            height: chunkViewportHeight
           });
         }
 
-        currentY += currentChunkHeight;
+        // Check if we've reached the bottom of the page:
+        // 1. Viewport bottom reached or exceeded document height
+        // 2. Or subsequent scroll didn't move downwards (browser clamped to maxScroll)
+        if (actualY + chunkViewportHeight >= finalHeight || (chunkIndex > 0 && actualY <= (chunks[chunks.length - 2]?.actualY ?? -1))) {
+          isAtBottom = true;
+          break;
+        }
+
+        targetY = actualY + chunkViewportHeight;
         chunkIndex++;
       }
 
@@ -462,31 +480,82 @@ async function captureFullPage(tab, overrideOptions = {}) {
       // -----------------------------------------------------------------------
       setActionBadge(tabId, '拼装', '#8b5cf6');
 
+      // Calculate clean, non-overlapping slices for each chunk to eliminate any duplicate areas
+      const resolvedSlices = [];
+      let drawnUpToY = 0;
+
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const actualY = chunk.actualY;
+        const h = chunk.height;
+
+        if (actualY + h <= drawnUpToY) {
+          // Chunk is completely contained in previously drawn content
+          continue;
+        }
+
+        let srcY = 0;
+        let srcH = h;
+        let destY = actualY;
+
+        if (actualY < drawnUpToY) {
+          // Chunk partially overlaps previous chunk (due to scroll clamping at bottom)
+          const overlap = drawnUpToY - actualY;
+          srcY = overlap;
+          srcH = h - overlap;
+          destY = drawnUpToY;
+        }
+
+        resolvedSlices.push({
+          chunkIndex: i,
+          srcY,
+          srcH,
+          destY,
+          destH: srcH
+        });
+
+        drawnUpToY = destY + srcH;
+      }
+
+      const totalStitchedHeight = Math.max(drawnUpToY, finalHeight);
       const MAX_CANVAS_SAFE_HEIGHT = 60000;
-      const partCount = Math.ceil(finalHeight / MAX_CANVAS_SAFE_HEIGHT);
+      const partCount = Math.ceil(totalStitchedHeight / MAX_CANVAS_SAFE_HEIGHT);
       savedPartsCount = partCount;
 
       for (let p = 0; p < partCount; p++) {
         const partStartY = p * MAX_CANVAS_SAFE_HEIGHT;
-        const partEndY = Math.min(finalHeight, (p + 1) * MAX_CANVAS_SAFE_HEIGHT);
+        const partEndY = Math.min(totalStitchedHeight, (p + 1) * MAX_CANVAS_SAFE_HEIGHT);
         const partHeight = partEndY - partStartY;
 
         const canvas = new OffscreenCanvas(finalWidth, partHeight);
         const ctx = canvas.getContext('2d');
 
-        // Draw overlapping chunks onto this part's canvas
-        for (const chunk of chunks) {
-          const chunkTop = chunk.y;
-          const chunkBottom = chunk.y + chunk.height;
+        // Draw resolved slices onto this part's canvas
+        for (const slice of resolvedSlices) {
+          const sliceStart = slice.destY;
+          const sliceEnd = slice.destY + slice.destH;
 
-          // Check if this chunk falls inside current part
-          if (chunkBottom > partStartY && chunkTop < partEndY) {
+          // Check if this slice intersects current canvas part
+          if (sliceEnd > partStartY && sliceStart < partEndY) {
+            const visibleStart = Math.max(sliceStart, partStartY);
+            const visibleEnd = Math.min(sliceEnd, partEndY);
+            const visibleHeight = visibleEnd - visibleStart;
+
+            const offsetFromSliceStart = visibleStart - sliceStart;
+            const finalSrcY = slice.srcY + offsetFromSliceStart;
+            const finalDestY = visibleStart - partStartY;
+
+            const chunk = chunks[slice.chunkIndex];
             const resp = await fetch(`data:image/png;base64,${chunk.data}`);
             const blob = await resp.blob();
             const bitmap = await createImageBitmap(blob);
 
-            // Draw relative to this part's Y offset
-            ctx.drawImage(bitmap, 0, chunkTop - partStartY);
+            // Draw with precise sub-rectangle cropping
+            ctx.drawImage(
+              bitmap,
+              0, finalSrcY, finalWidth, visibleHeight,
+              0, finalDestY, finalWidth, visibleHeight
+            );
             bitmap.close();
           }
         }
