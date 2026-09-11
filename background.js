@@ -1,10 +1,13 @@
 /**
  * Chrome Full Page Screenshot Extension - Background Service Worker
  * Powered by Chrome DevTools Protocol (CDP) + Dual-Engine Architecture:
- * 1. Single-Shot Native Engine (for pages <= 16,000px): Lightning-fast 1-shot capture
+ * 1. Single-Shot Native Engine (for pages <= 16,000px): Lightning-fast 1-shot capture (~300ms)
  * 2. Ultra-Long Multi-Chunk Slicing Engine (for pages > 16,000px, e.g. Comics/Webtoons):
- *    Captures all the way to the bottom without any height limit, stitches on OffscreenCanvas,
- *    and deduplicates sticky/fixed navigation bars.
+ *    - Captures all the way to the bottom without ANY height limit.
+ *    - Automatically slices into safe blocks (<= 60,000px) to prevent 16-bit uint16_t canvas overflow
+ *      ("The size of 'OffscreenCanvas' is zero" error).
+ *    - Preserves 100% crystal-clear original resolution.
+ *    - Deduplicates sticky/fixed navigation bars so they appear only once at the very top.
  */
 
 // Helper to wrap chrome.debugger.sendCommand in Promise
@@ -67,7 +70,7 @@ function formatDateTime() {
   return { date, time, full: `${date}_${time}` };
 }
 
-function buildFilename(tab, settings, ext) {
+function buildFilename(tab, settings, ext, suffix = '') {
   const { date, time } = formatDateTime();
   const rawTitle = tab.title || '网页长截图';
   const cleanTitle = sanitizeFilename(rawTitle);
@@ -93,7 +96,7 @@ function buildFilename(tab, settings, ext) {
     filename = `全景长截屏_${cleanTitle}_${date}_${time}`;
   }
 
-  return `${filename}.${ext}`;
+  return `${filename}${suffix}.${ext}`;
 }
 
 // Send Toast ONLY AFTER capture is completely finished to guarantee NO in-page obstruction
@@ -262,14 +265,13 @@ async function captureFullPage(tab, overrideOptions = {}) {
     const ext = format === 'jpeg' ? 'jpg' : format === 'webp' ? 'webp' : 'png';
     const quality = Math.min(100, Math.max(10, settings.quality || 95));
 
-    let finalDataUrl = '';
-
     // =========================================================================
     // DUAL-ENGINE STRATEGY:
     // Engine A: Single-Shot (height <= 16,000px) - Instant 1-shot capture (~300ms)
     // Engine B: Ultra-Long Multi-Chunk Slicing (height > 16,000px, e.g. Comics) - No length limit!
     // =========================================================================
     const SINGLE_SHOT_THRESHOLD = 16000;
+    let savedPartsCount = 1;
 
     if (finalHeight <= SINGLE_SHOT_THRESHOLD) {
       // -----------------------------------------------------------------------
@@ -302,13 +304,21 @@ async function captureFullPage(tab, overrideOptions = {}) {
       if (!screenshotResult || !screenshotResult.data) {
         throw new Error("未能获取到截屏数据");
       }
-      finalDataUrl = `data:${mime};base64,${screenshotResult.data}`;
+
+      const finalDataUrl = `data:${mime};base64,${screenshotResult.data}`;
+      const filename = buildFilename(tab, settings, ext);
+
+      await chrome.downloads.download({
+        url: finalDataUrl,
+        filename: filename,
+        saveAs: false
+      });
 
     } else {
       // -----------------------------------------------------------------------
       // ENGINE B: Ultra-Long Multi-Chunk Slicing Engine (NO HEIGHT LIMIT!)
-      // Slices the page in blocks of 8,000px, hides fixed elements for chunks > 0,
-      // and stitches them seamlessly on high-capacity OffscreenCanvas.
+      // Slices the page into safe blocks of 8,000px, hides fixed elements for chunks > 0,
+      // and stitches them onto OffscreenCanvas without uint16_t (65,535px) overflow!
       // -----------------------------------------------------------------------
       const CHUNK_HEIGHT = 8000;
       const chunks = [];
@@ -319,7 +329,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
         const remaining = finalHeight - currentY;
         const currentChunkHeight = Math.min(CHUNK_HEIGHT, remaining);
 
-        // Update badge to show live progress (e.g. "1/4", "2/4")
+        // Update badge to show live progress (e.g. "1/5", "2/5")
         const estTotalChunks = Math.ceil(finalHeight / CHUNK_HEIGHT);
         setActionBadge(tabId, `${chunkIndex + 1}/${estTotalChunks}`, '#2563eb');
 
@@ -352,8 +362,8 @@ async function captureFullPage(tab, overrideOptions = {}) {
         });
         hasOverriddenMetrics = true;
 
-        // Wait 150ms for images and layout in the new slice to render
-        await new Promise(r => setTimeout(r, 160));
+        // Wait 220ms for comic images and layout in the new slice to render
+        await new Promise(r => setTimeout(r, 220));
 
         // Check if page height dynamically expanded (infinite scroll / lazy loading webtoon)
         try {
@@ -402,34 +412,70 @@ async function captureFullPage(tab, overrideOptions = {}) {
         });
       } catch (e) {}
 
-      // Stitch chunks onto an OffscreenCanvas
-      setActionBadge(tabId, '拼接', '#8b5cf6');
-      const canvas = new OffscreenCanvas(finalWidth, finalHeight);
-      const ctx = canvas.getContext('2d');
-
-      for (const chunk of chunks) {
-        const resp = await fetch(`data:image/png;base64,${chunk.data}`);
-        const blob = await resp.blob();
-        const bitmap = await createImageBitmap(blob);
-        ctx.drawImage(bitmap, 0, chunk.y, chunk.width, chunk.height);
-        bitmap.close();
+      // Clear device metrics before stitching
+      if (hasOverriddenMetrics) {
+        try {
+          await sendCdp(debuggee, "Emulation.clearDeviceMetricsOverride");
+          hasOverriddenMetrics = false;
+        } catch (e) {}
       }
 
-      const finalBlob = await canvas.convertToBlob({
-        type: mime,
-        quality: (format === 'jpeg' || format === 'webp') ? (quality / 100) : undefined
-      });
-      finalDataUrl = await blobToDataUrl(finalBlob);
+      // -----------------------------------------------------------------------
+      // STITCHING & MULTI-PART PARTITIONING:
+      // Chrome's convertToBlob on OffscreenCanvas has a strict 16-bit uint16_t
+      // limit (65,535px). If height exceeds 60,000px, we partition the output
+      // into sequential crystal-clear parts (_Part1, _Part2, etc.)
+      // This prevents the "The size of 'OffscreenCanvas' is zero" error completely!
+      // -----------------------------------------------------------------------
+      setActionBadge(tabId, '拼装', '#8b5cf6');
+
+      const MAX_CANVAS_SAFE_HEIGHT = 60000;
+      const partCount = Math.ceil(finalHeight / MAX_CANVAS_SAFE_HEIGHT);
+      savedPartsCount = partCount;
+
+      for (let p = 0; p < partCount; p++) {
+        const partStartY = p * MAX_CANVAS_SAFE_HEIGHT;
+        const partEndY = Math.min(finalHeight, (p + 1) * MAX_CANVAS_SAFE_HEIGHT);
+        const partHeight = partEndY - partStartY;
+
+        const canvas = new OffscreenCanvas(finalWidth, partHeight);
+        const ctx = canvas.getContext('2d');
+
+        // Draw overlapping chunks onto this part's canvas
+        for (const chunk of chunks) {
+          const chunkTop = chunk.y;
+          const chunkBottom = chunk.y + chunk.height;
+
+          // Check if this chunk falls inside current part
+          if (chunkBottom > partStartY && chunkTop < partEndY) {
+            const resp = await fetch(`data:image/png;base64,${chunk.data}`);
+            const blob = await resp.blob();
+            const bitmap = await createImageBitmap(blob);
+
+            // Draw relative to this part's Y offset
+            ctx.drawImage(bitmap, 0, chunkTop - partStartY);
+            bitmap.close();
+          }
+        }
+
+        const partBlob = await canvas.convertToBlob({
+          type: mime,
+          quality: (format === 'jpeg' || format === 'webp') ? (quality / 100) : undefined
+        });
+
+        const partDataUrl = await blobToDataUrl(partBlob);
+        const partSuffix = partCount > 1 ? `_第${p + 1}卷` : '';
+        const filename = buildFilename(tab, settings, ext, partSuffix);
+
+        await chrome.downloads.download({
+          url: partDataUrl,
+          filename: filename,
+          saveAs: false
+        });
+      }
     }
 
-    // 5. Clear Device Metrics Override & Restore User Scroll Position
-    if (hasOverriddenMetrics) {
-      try {
-        await sendCdp(debuggee, "Emulation.clearDeviceMetricsOverride");
-        hasOverriddenMetrics = false;
-      } catch (e) {}
-    }
-
+    // 5. Restore User's Original Scroll Position
     if (domMetrics && (domMetrics.origScrollX || domMetrics.origScrollY)) {
       try {
         await chrome.scripting.executeScript({
@@ -440,24 +486,20 @@ async function captureFullPage(tab, overrideOptions = {}) {
       } catch (e) {}
     }
 
-    // 6. Build Filename and Trigger Download
-    const filename = buildFilename(tab, settings, ext);
-    await chrome.downloads.download({
-      url: finalDataUrl,
-      filename: filename,
-      saveAs: false
-    });
-
-    // 7. Success Feedback: Badge on Toolbar
+    // 6. Success Feedback: Badge on Toolbar
     setActionBadge(tabId, '✓', '#10b981');
     clearActionBadge(tabId, 2500);
 
     // Show toast ONLY AFTER capture and download is complete (never in the screenshot!)
     if (settings.showToast) {
+      const subtitle = savedPartsCount > 1
+        ? `${finalWidth}×${finalHeight}px · 超长页面已自动分 ${savedPartsCount} 卷原画保存到底`
+        : `${finalWidth}×${finalHeight}px · 已无限制截到底`;
+
       sendToast(tabId, {
         status: 'success',
         title: '长截屏已保存成功！',
-        subtitle: `${finalWidth}×${finalHeight}px · 已无限制截到底`
+        subtitle: subtitle
       });
     }
 
