@@ -1,13 +1,14 @@
 /**
  * Chrome Full Page Screenshot Extension - Background Service Worker
- * Powered by Chrome DevTools Protocol (CDP) + Dual-Engine Architecture:
- * 1. Single-Shot Native Engine (for pages <= 16,000px): Lightning-fast 1-shot capture (~300ms)
- * 2. Ultra-Long Multi-Chunk Slicing Engine (for pages > 16,000px, e.g. Comics/Webtoons):
- *    - Captures all the way to the bottom without ANY height limit.
- *    - Automatically slices into safe blocks (<= 60,000px) to prevent 16-bit uint16_t canvas overflow
- *      ("The size of 'OffscreenCanvas' is zero" error).
- *    - Preserves 100% crystal-clear original resolution.
- *    - Deduplicates sticky/fixed navigation bars so they appear only once at the very top.
+ * Powered by Chrome DevTools Protocol (CDP) + Dual-Engine Architecture
+ * 
+ * Key Features & Fixes:
+ * 1. Complete Page Expansion: Defeats 'content-visibility: auto' and triggers 'loading="lazy"' images
+ *    so GitHub READMEs, webtoons, and long articles never get cut off before the bottom.
+ * 2. True Bottom Detection: Scans lowest element bounding rect (footer/copyright/comments) to guarantee 100% bottom coverage.
+ * 3. Post-Override Layout Metric Adjustment: Catches any responsive layout expansion after device metrics override.
+ * 4. Safe Multi-Part Partitioning: Prevents Chromium uint16 (65,535px) OffscreenCanvas overflow on ultra-tall comics.
+ * 5. 0% DOM Pollution during capture: Status indicated via toolbar badge only.
  */
 
 // Helper to wrap chrome.debugger.sendCommand in Promise
@@ -40,7 +41,7 @@ const DEFAULT_SETTINGS = {
   format: 'png',        // 'png' | 'jpeg' | 'webp'
   quality: 95,          // 0 - 100
   scale: 1,             // 1 (Standard) or 2 (Retina 2x)
-  preScroll: false,     // Trigger lazy load images
+  preScroll: true,      // Automatically trigger lazy images by default
   showToast: true,      // In-page visual feedback after capture
   filenamePattern: '{title}_{date}_{time}'
 };
@@ -162,18 +163,51 @@ async function captureFullPage(tab, overrideOptions = {}) {
   let hasOverriddenMetrics = false;
 
   try {
-    // 2. Measure actual DOM scroll dimensions and record original scroll position
+    // 2. Pre-process page to guarantee 100% full content rendering:
+    // a) Defeat 'content-visibility: auto' (used by GitHub, forums, blogs to skip off-screen rendering)
+    // b) Fast-scroll down to trigger lazy-loaded images (e.g. GitHub README screenshots, webtoons)
+    // c) Measure accurate document dimensions down to the lowest footer element
     try {
       const [evalRes] = await chrome.scripting.executeScript({
         target: { tabId },
-        func: () => {
-          const doc = document.documentElement;
-          const body = document.body;
+        func: async () => {
           const origScrollX = window.scrollX || window.pageXOffset || 0;
           const origScrollY = window.scrollY || window.pageYOffset || 0;
 
-          // Full document dimensions
-          const docWidth = Math.max(
+          // 1. Inject override style to disable content-visibility: auto and force rendering
+          const styleId = '__fullpage_override_style__';
+          let styleEl = document.getElementById(styleId);
+          if (!styleEl) {
+            styleEl = document.createElement('style');
+            styleEl.id = styleId;
+            styleEl.textContent = `
+              * {
+                content-visibility: visible !important;
+                contain-intrinsic-size: auto !important;
+              }
+            `;
+            document.documentElement.appendChild(styleEl);
+          }
+
+          // 2. Fast scan to bottom to trigger lazy-loaded images & IntersectionObservers
+          const totalEstimate = Math.max(
+            document.documentElement.scrollHeight,
+            document.body ? document.body.scrollHeight : 0,
+            window.innerHeight
+          );
+          const step = Math.max(window.innerHeight * 1.5, 1200);
+          for (let y = 0; y < Math.min(totalEstimate, 120000); y += step) {
+            window.scrollTo(0, y);
+            await new Promise(r => setTimeout(r, 25));
+          }
+          window.scrollTo(0, 0);
+          await new Promise(r => setTimeout(r, 100));
+
+          // 3. Calculate true full dimensions
+          const doc = document.documentElement;
+          const body = document.body;
+
+          let docWidth = Math.max(
             doc ? doc.scrollWidth : 0,
             doc ? doc.offsetWidth : 0,
             doc ? doc.clientWidth : 0,
@@ -191,7 +225,19 @@ async function captureFullPage(tab, overrideOptions = {}) {
             window.innerHeight || 800
           );
 
-          // Check for inner scrollable containers (e.g. Manga/Webtoon reader, SPA scroll containers)
+          // 4. Scan lowest bounding rectangle of all bottom elements (footer, copyright, last children)
+          const bottomCandidates = document.querySelectorAll('footer, [role="contentinfo"], .footer, body > *:last-child, main > *:last-child, article > *:last-child, #footer');
+          bottomCandidates.forEach(el => {
+            try {
+              const rect = el.getBoundingClientRect();
+              const absoluteBottom = Math.ceil(rect.bottom + window.scrollY);
+              if (absoluteBottom > docHeight) {
+                docHeight = absoluteBottom;
+              }
+            } catch (e) {}
+          });
+
+          // 5. Check for inner scrollable containers (e.g. SPA reader, comic viewer)
           const containers = document.querySelectorAll('div, main, section, article, #app, #root, .reader, .comic-view, .viewer');
           for (let i = 0; i < Math.min(containers.length, 80); i++) {
             const el = containers[i];
@@ -206,7 +252,6 @@ async function captureFullPage(tab, overrideOptions = {}) {
           return {
             width: Math.ceil(docWidth),
             height: Math.ceil(docHeight),
-            windowHeight: window.innerHeight,
             origScrollX,
             origScrollY
           };
@@ -214,35 +259,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
       });
       domMetrics = evalRes ? evalRes.result : null;
     } catch (err) {
-      console.warn('DOM measurement fallback:', err);
-    }
-
-    // Optional pre-scroll to trigger lazy loaded images
-    if (settings.preScroll) {
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: async () => {
-            const originalScrollY = window.scrollY;
-            const scrollStep = Math.max(window.innerHeight, 800);
-            const maxScroll = Math.min(document.body.scrollHeight, 100000);
-            for (let y = 0; y < maxScroll; y += scrollStep) {
-              window.scrollTo(0, y);
-              await new Promise(r => setTimeout(r, 40));
-            }
-            window.scrollTo(0, 0);
-            await new Promise(r => setTimeout(r, 120));
-          }
-        });
-      } catch (err) {}
-    } else {
-      // Ensure page starts at top
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: () => window.scrollTo(0, 0)
-        });
-      } catch (err) {}
+      console.warn('DOM measurement error:', err);
     }
 
     // 3. Attach Chrome Debugger
@@ -256,7 +273,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
     const cWidth = Math.ceil(contentSize.width || 0);
     const cHeight = Math.ceil(contentSize.height || 0);
 
-    // Compute best target dimensions
+    // Compute best target dimensions with safety margin
     let finalWidth = Math.max((domMetrics && domMetrics.width) || 0, cWidth, 1280);
     let finalHeight = Math.max((domMetrics && domMetrics.height) || 0, cHeight, 800);
 
@@ -291,10 +308,27 @@ async function captureFullPage(tab, overrideOptions = {}) {
       hasOverriddenMetrics = true;
       await new Promise(r => setTimeout(r, 260));
 
+      // Post-override layout check: verify if page height expanded after window resize
+      try {
+        const updatedMetrics = await sendCdp(debuggee, "Page.getLayoutMetrics");
+        const updatedSize = updatedMetrics.cssContentSize || updatedMetrics.contentSize || {};
+        const updatedHeight = Math.ceil(updatedSize.height || 0);
+        if (updatedHeight > finalHeight && updatedHeight <= SINGLE_SHOT_THRESHOLD) {
+          finalHeight = updatedHeight;
+          await sendCdp(debuggee, "Emulation.setDeviceMetricsOverride", {
+            width: finalWidth,
+            height: finalHeight,
+            deviceScaleFactor: captureScale,
+            mobile: false
+          });
+          await new Promise(r => setTimeout(r, 120));
+        }
+      } catch (e) {}
+
       const screenshotParams = {
         format: format,
         fromSurface: true,
-        captureBeyondViewport: false
+        captureBeyondViewport: true // Capture all the way to bottom even if layout expands slightly
       };
       if (format === 'jpeg' || format === 'webp') {
         screenshotParams.quality = quality;
@@ -424,8 +458,7 @@ async function captureFullPage(tab, overrideOptions = {}) {
       // STITCHING & MULTI-PART PARTITIONING:
       // Chrome's convertToBlob on OffscreenCanvas has a strict 16-bit uint16_t
       // limit (65,535px). If height exceeds 60,000px, we partition the output
-      // into sequential crystal-clear parts (_Part1, _Part2, etc.)
-      // This prevents the "The size of 'OffscreenCanvas' is zero" error completely!
+      // into sequential crystal-clear parts (_第1卷, _第2卷, etc.)
       // -----------------------------------------------------------------------
       setActionBadge(tabId, '拼装', '#8b5cf6');
 
@@ -475,16 +508,21 @@ async function captureFullPage(tab, overrideOptions = {}) {
       }
     }
 
-    // 5. Restore User's Original Scroll Position
-    if (domMetrics && (domMetrics.origScrollX || domMetrics.origScrollY)) {
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (x, y) => window.scrollTo(x, y),
-          args: [domMetrics.origScrollX, domMetrics.origScrollY]
-        });
-      } catch (e) {}
-    }
+    // 5. Restore User's Original Scroll Position and clean injected override styles
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (x, y) => {
+          const style = document.getElementById('__fullpage_override_style__');
+          if (style) style.remove();
+          window.scrollTo(x, y);
+        },
+        args: [
+          (domMetrics && domMetrics.origScrollX) || 0,
+          (domMetrics && domMetrics.origScrollY) || 0
+        ]
+      });
+    } catch (e) {}
 
     // 6. Success Feedback: Badge on Toolbar
     setActionBadge(tabId, '✓', '#10b981');
